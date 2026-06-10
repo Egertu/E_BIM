@@ -1,0 +1,18 @@
+metadata:
+  name: E_BIM Cable Routing
+  description: Automated cable circuit routing in Revit
+  version: 1.0.0
+  author: Egertu
+  keywords:
+    - cable
+    - routing
+    - electrical
+
+tabs:
+- name: Routing
+  icon: null
+  items:
+  - name: Route Circuits
+    tooltip: Automated cable circuit routing
+    script: script.py
+    engine: IronPython
