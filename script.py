@@ -7,7 +7,7 @@ Automated electrical circuit routing in Revit cable trays, conduits, and pipes.
 Вся функциональность интегрирована в один файл для использования в pyRevit.
 
 Техническое задание:
-1. Находить кабельные системы по названию
+1. Находить кабельные системы по названию В ОСНОВНОЙ И СВЯЗАННЫХ МОДЕЛЯХ
 2. Строить ортогональный граф прохождения кабельных маршрутов
 3. Вычислять оптимальные пути между электрооборудованием (A*)
 4. Рассчитывать длины участков в разных типах коммуникаций
@@ -29,7 +29,8 @@ try:
     from Autodesk.Revit.DB import (
         BuiltInCategory, FilteredElementCollector, Transaction,
         XYZ, Transform, Line, Arc, Curve, CurveArray,
-        ElementType, FamilyInstance, ConnectorType, CurveElement
+        ElementType, FamilyInstance, ConnectorType, CurveElement,
+        RevitLinkInstance
     )
     PYREVIT_AVAILABLE = True
 except ImportError:
@@ -183,12 +184,65 @@ def rollback_transaction(trans):
             pass
 
 
+def get_all_linked_documents(main_doc):
+    """Получить все связанные документы.
+    
+    Args:
+        main_doc: Основной документ Revit
+        
+    Returns:
+        List: Список кортежей (linked_doc, linked_instance, transform)
+    """
+    linked_docs = []
+    
+    try:
+        # Получить все RevitLinkInstance в документе
+        collector = FilteredElementCollector(main_doc).OfClass(RevitLinkInstance)
+        
+        for link_instance in collector:
+            try:
+                linked_doc = link_instance.GetLinkDocument()
+                if linked_doc and not linked_doc.IsLinked:
+                    # Получить трансформацию связи
+                    transform = link_instance.GetTotalTransform()
+                    linked_docs.append({
+                        'doc': linked_doc,
+                        'instance': link_instance,
+                        'transform': transform,
+                        'name': link_instance.Name
+                    })
+            except:
+                pass
+    except Exception as e:
+        print(f"Ошибка при получении связанных документов: {e}")
+    
+    return linked_docs
+
+
+def apply_transform_to_point(point, transform):
+    """Применить трансформацию к точке.
+    
+    Args:
+        point: XYZ точка
+        transform: Transform объект
+        
+    Returns:
+        XYZ: Трансформированная точка
+    """
+    if point is None or transform is None:
+        return point
+    try:
+        return transform.OfPoint(point)
+    except:
+        return point
+
+
 # ============================================================================
-# CABLE TRAY MANAGER
+# CABLE TRAY MANAGER - WITH LINKED MODELS SUPPORT
 # ============================================================================
 
 class CableTrayManager:
-    """Управление кабельными лотками и обнаружение систем."""
+    """Управление кабельными лотками и обнаружение систем. ПОДДЕРЖКА СВЯЗАННЫХ МОДЕЛЕЙ."""
     
     def __init__(self, document):
         """Инициализация менеджера кабельных лотков.
@@ -198,6 +252,41 @@ class CableTrayManager:
         """
         self.doc = document
         self.logger = setup_logger(__name__)
+        self.linked_docs = []
+    
+    def select_linked_model(self):
+        """Позволить пользователю выбрать связанный документ для поиска.
+        
+        Returns:
+            Dict: Выбранный связанный документ или None
+        """
+        linked_docs = get_all_linked_documents(self.doc)
+        
+        if not linked_docs:
+            self.logger.info("Связанные модели не найдены. Будет использована основная модель.")
+            return None
+        
+        try:
+            link_names = [f"{link['name']}" for link in linked_docs]
+            link_names.insert(0, "Только основная модель")
+            
+            selected = forms.ask_for_one_item(
+                link_names,
+                default=link_names[0],
+                prompt="Выберите модель для поиска кабельных лотков:",
+                title="Выбор модели"
+            )
+            
+            if selected == "Только основная модель":
+                return None
+            
+            for link_doc in linked_docs:
+                if link_doc['name'] == selected:
+                    return link_doc
+        except:
+            pass
+        
+        return None
     
     def get_tray_name_from_user(self):
         """Получить название кабельной системы от пользователя.
@@ -215,18 +304,54 @@ class CableTrayManager:
         except:
             return None
     
-    def get_cable_trays_by_name(self, tray_names, link_doc=None, transform=None):
+    def get_cable_trays_by_name(self, tray_names, link_doc_info=None):
         """Получить кабельные лотки по названию системы.
+        ПОИСК В ОСНОВНОЙ МОДЕЛИ И ВЫБРАННОЙ СВЯЗАННОЙ МОДЕЛИ.
         
         Args:
             tray_names: Список названий систем для поиска
-            link_doc: Связанный документ (опционально)
-            transform: Трансформация (опционально)
+            link_doc_info: Информация о связанной модели (опционально)
             
         Returns:
             List[Dict]: Список словарей с информацией о лотках
         """
-        search_doc = link_doc or self.doc
+        all_trays = []
+        
+        # Поиск в основной модели
+        self.logger.info("Поиск лотков в основной модели...")
+        main_trays = self._search_trays_in_doc(self.doc, tray_names, None, None)
+        all_trays.extend(main_trays)
+        self.logger.info(f"  Найдено в основной модели: {len(main_trays)}")
+        
+        # Поиск в связанной модели (если выбрана)
+        if link_doc_info:
+            try:
+                self.logger.info(f"Поиск лотков в связанной модели: {link_doc_info['name']}...")
+                linked_trays = self._search_trays_in_doc(
+                    link_doc_info['doc'],
+                    tray_names,
+                    link_doc_info['transform'],
+                    link_doc_info['instance']
+                )
+                all_trays.extend(linked_trays)
+                self.logger.info(f"  Найдено в связанной модели: {len(linked_trays)}")
+            except Exception as e:
+                self.logger.error(f"Ошибка при поиске в связанной модели: {e}")
+        
+        return all_trays
+    
+    def _search_trays_in_doc(self, search_doc, tray_names, transform=None, link_instance=None):
+        """Внутренняя функция поиска лотков в документе.
+        
+        Args:
+            search_doc: Документ для поиска
+            tray_names: Список названий систем
+            transform: Трансформация (для связанных моделей)
+            link_instance: Объект связи
+            
+        Returns:
+            List[Dict]: Найденные лотки
+        """
         trays = []
         
         try:
@@ -238,33 +363,74 @@ class CableTrayManager:
                 try:
                     system_param = get_element_parameter(tray, PARAM_SYSTEM_NAME)
                     if system_param and system_param in tray_names:
+                        location = tray.Location.Point if tray.Location else None
+                        
+                        # Применить трансформацию если это связанная модель
+                        if transform and location:
+                            location = apply_transform_to_point(location, transform)
+                        
                         trays.append({
                             'element': tray,
                             'id': tray.Id,
                             'name': tray.Name,
                             'system': system_param,
-                            'location': tray.Location.Point if tray.Location else None
+                            'location': location,
+                            'from_linked': link_instance is not None,
+                            'linked_instance': link_instance,
+                            'transform': transform
                         })
                 except:
                     pass
-            
-            self.logger.info(f"Найдено кабельных лотков: {len(trays)}")
         except Exception as e:
             self.logger.error(f"Ошибка при сборе лотков: {e}")
         
         return trays
     
-    def get_cable_tray_fittings(self, link_doc=None, transform=None):
+    def get_cable_tray_fittings(self, link_doc_info=None):
         """Получить фитинги кабельных лотков.
+        ПОИСК В ОСНОВНОЙ И СВЯЗАННОЙ МОДЕЛЯХ.
         
         Args:
-            link_doc: Связанный документ (опционально)
-            transform: Трансформация (опционально)
+            link_doc_info: Информация о связанной модели (опционально)
             
         Returns:
             List: Список элементов-фитингов
         """
-        search_doc = link_doc or self.doc
+        all_fittings = []
+        
+        # Фитинги из основной модели
+        self.logger.info("Поиск фитингов в основной модели...")
+        main_fittings = self._search_fittings_in_doc(self.doc, None, None)
+        all_fittings.extend(main_fittings)
+        self.logger.info(f"  Найдено в основной модели: {len(main_fittings)}")
+        
+        # Фитинги из связанной модели (если выбрана)
+        if link_doc_info:
+            try:
+                self.logger.info(f"Поиск фитингов в связанной модели: {link_doc_info['name']}...")
+                linked_fittings = self._search_fittings_in_doc(
+                    link_doc_info['doc'],
+                    link_doc_info['transform'],
+                    link_doc_info['instance']
+                )
+                all_fittings.extend(linked_fittings)
+                self.logger.info(f"  Найдено в связанной модели: {len(linked_fittings)}")
+            except Exception as e:
+                self.logger.error(f"Ошибка при поиске фитингов в связанной модели: {e}")
+        
+        return all_fittings
+    
+    def _search_fittings_in_doc(self, search_doc, transform=None, link_instance=None):
+        """Внутренняя функция поиска фитингов в документе.
+        
+        Args:
+            search_doc: Документ для поиска
+            transform: Трансформация
+            link_instance: Объект связи
+            
+        Returns:
+            List[Dict]: Найденные фитинги
+        """
         fittings = []
         
         try:
@@ -272,31 +438,86 @@ class CableTrayManager:
             collector = FilteredElementCollector(search_doc).OfCategory(
                 BuiltInCategory.OST_CableTrayFitting
             ).WhereElementIsNotElementType()
-            fittings.extend(list(collector))
+            
+            for fitting in collector:
+                try:
+                    location = fitting.Location.Point if fitting.Location else None
+                    if transform and location:
+                        location = apply_transform_to_point(location, transform)
+                    
+                    fittings.append({
+                        'element': fitting,
+                        'id': fitting.Id,
+                        'location': location,
+                        'from_linked': link_instance is not None,
+                        'transform': transform
+                    })
+                except:
+                    pass
             
             # Фитинги кабелепроводов
             collector = FilteredElementCollector(search_doc).OfCategory(
                 BuiltInCategory.OST_ConduitFitting
             ).WhereElementIsNotElementType()
-            fittings.extend(list(collector))
             
-            self.logger.info(f"Найдено фитингов: {len(fittings)}")
+            for fitting in collector:
+                try:
+                    location = fitting.Location.Point if fitting.Location else None
+                    if transform and location:
+                        location = apply_transform_to_point(location, transform)
+                    
+                    fittings.append({
+                        'element': fitting,
+                        'id': fitting.Id,
+                        'location': location,
+                        'from_linked': link_instance is not None,
+                        'transform': transform
+                    })
+                except:
+                    pass
         except Exception as e:
             self.logger.error(f"Ошибка при сборе фитингов: {e}")
         
         return fittings
     
-    def get_conduits_by_name(self, system_names, link_doc=None):
+    def get_conduits_by_name(self, system_names, link_doc_info=None):
         """Получить кабелепроводы по названию системы.
+        ПОИСК В ОСНОВНОЙ И СВЯЗАННОЙ МОДЕЛЯХ.
         
         Args:
             system_names: Список названий систем
-            link_doc: Связанный документ (опционально)
+            link_doc_info: Информация о связанной модели (опционально)
             
         Returns:
             List[Dict]: Список кабелепроводов
         """
-        search_doc = link_doc or self.doc
+        all_conduits = []
+        
+        # Поиск в основной модели
+        self.logger.info("Поиск кабелепроводов в основной модели...")
+        main_conduits = self._search_conduits_in_doc(self.doc, system_names, None, None)
+        all_conduits.extend(main_conduits)
+        self.logger.info(f"  Найдено в основной модели: {len(main_conduits)}")
+        
+        # Поиск в связанной модели (если выбрана)
+        if link_doc_info:
+            try:
+                self.logger.info(f"Поиск кабелепроводов в связанной модели: {link_doc_info['name']}...")
+                linked_conduits = self._search_conduits_in_doc(
+                    link_doc_info['doc'],
+                    system_names,
+                    link_doc_info['transform'],
+                    link_doc_info['instance']
+                )
+                all_conduits.extend(linked_conduits)
+                self.logger.info(f"  Найдено в связанной модели: {len(linked_conduits)}")
+            except Exception as e:
+                self.logger.error(f"Ошибка при поиске кабелепроводов в связанной модели: {e}")
+        
+        return all_conduits
+    
+    def _search_conduits_in_doc(self, search_doc, system_names, transform=None, link_instance=None):
+        """Внутренняя функция поиска кабелепроводов в документе."""
         conduits = []
         
         try:
@@ -308,11 +529,18 @@ class CableTrayManager:
                 try:
                     system_param = get_element_parameter(conduit, PARAM_SYSTEM_NAME)
                     if system_param and system_param in system_names:
+                        location = conduit.Location.Point if conduit.Location else None
+                        if transform and location:
+                            location = apply_transform_to_point(location, transform)
+                        
                         conduits.append({
                             'element': conduit,
                             'id': conduit.Id,
                             'name': conduit.Name,
-                            'system': system_param
+                            'system': system_param,
+                            'location': location,
+                            'from_linked': link_instance is not None,
+                            'transform': transform
                         })
                 except:
                     pass
@@ -337,14 +565,12 @@ class CableTrayManager:
         
         for tray_dict in trays:
             try:
-                tray = tray_dict['element']
-                # Упрощенная проверка: расстояние до центра лотка
-                tray_point = tray.Location.Point if tray.Location else None
+                tray_point = tray_dict.get('location')
                 if tray_point:
                     dist = distance_3d(point, tray_point)
                     if dist < min_distance:
                         min_distance = dist
-                        closest_tray = tray
+                        closest_tray = tray_dict
             except:
                 pass
         
@@ -521,8 +747,7 @@ class GraphBuilder:
         """Добавить узлы графа для каждого лотка."""
         for tray_dict in trays:
             try:
-                tray = tray_dict['element']
-                location = tray.Location.Point
+                location = tray_dict.get('location')
                 if location:
                     node_key = xyz_to_tuple(location)
                     self.xyz_dict[node_key] = location
@@ -554,8 +779,8 @@ class GraphBuilder:
         """Добавить узлы для фитингов."""
         for fitting in fittings:
             try:
-                if fitting.Location:
-                    location = fitting.Location.Point
+                location = fitting.get('location')
+                if location:
                     node_key = xyz_to_tuple(location)
                     if node_key not in self.xyz_dict:
                         self.xyz_dict[node_key] = location
@@ -636,7 +861,7 @@ class GraphBuilder:
         # 2. Вертикальная промежуточная точка
         if target_z is None and trays:
             try:
-                target_z = trays[0]['element'].Location.Point.Z
+                target_z = trays[0].get('location').Z
             except:
                 target_z = equipment_point.Z
         
@@ -921,6 +1146,7 @@ def main():
     
     logger.info("\n" + "="*70)
     logger.info("СИСТЕМА АВТОМАТИЧЕСКОЙ ПРОКЛАДКИ КАБЕЛЬНЫХ ЦЕПЕЙ")
+    logger.info("ПОДДЕРЖКА ОСНОВНОЙ МОДЕЛИ И СВЯЗАННЫХ ФАЙЛОВ")
     logger.info("="*70)
     
     try:
@@ -928,6 +1154,8 @@ def main():
         logger.info("\n=== ЭТАП 1: Инициализация и сбор данных ===")
         
         cable_tray_mgr = CableTrayManager(doc)
+        
+        # Запросить название системы
         tray_name = cable_tray_mgr.get_tray_name_from_user()
         
         if not tray_name:
@@ -936,19 +1164,30 @@ def main():
         
         logger.info(f"✓ Выбрана кабельная система: {tray_name}")
         
-        # Собрать кабельные лотки
-        trays = cable_tray_mgr.get_cable_trays_by_name([tray_name])
+        # Позволить выбрать связанную модель (опционально)
+        link_doc_info = cable_tray_mgr.select_linked_model()
+        if link_doc_info:
+            logger.info(f"✓ Выбрана связанная модель: {link_doc_info['name']}")
+        
+        # Собрать кабельные лотки из основной и связанной моделей
+        logger.info("\nПоиск кабельных лотков...")
+        trays = cable_tray_mgr.get_cable_trays_by_name([tray_name], link_doc_info)
         if not trays:
             logger.warning(f"Лотки системы '{tray_name}' не найдены")
             return
         
         # Собрать фитинги
-        fittings = cable_tray_mgr.get_cable_tray_fittings()
-        conduits = cable_tray_mgr.get_conduits_by_name([tray_name])
+        logger.info("Поиск фитингов...")
+        fittings = cable_tray_mgr.get_cable_tray_fittings(link_doc_info)
         
-        logger.info(f"✓ Найдено лотков: {len(trays)}")
-        logger.info(f"✓ Найдено фитингов: {len(fittings)}")
-        logger.info(f"✓ Найдено кабелепроводов: {len(conduits)}")
+        # Собрать кабелепроводы
+        logger.info("Поиск кабелепроводов...")
+        conduits = cable_tray_mgr.get_conduits_by_name([tray_name], link_doc_info)
+        
+        logger.info(f"\n✓ Всего найдено:")
+        logger.info(f"  - Лотков: {len(trays)}")
+        logger.info(f"  - Фитингов: {len(fittings)}")
+        logger.info(f"  - Кабелепроводов: {len(conduits)}")
         
         # ЭТАП 2: Построение графа
         logger.info("\n=== ЭТАП 2: Построение графа маршрутизации ===")
@@ -995,6 +1234,10 @@ def main():
         # ИТОГИ
         logger.info("\n" + "="*70)
         logger.success(f"✓ Обработано цепей: {processed_count}/{len(circuits)}")
+        logger.success(f"✓ Система поддерживает:")
+        logger.success(f"  - Поиск в основной модели")
+        logger.success(f"  - Поиск в связанных файлах")
+        logger.success(f"  - Трансформацию координат из связанных моделей")
         logger.info("="*70)
         
     except Exception as e:
